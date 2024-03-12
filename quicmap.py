@@ -16,6 +16,7 @@ from tqdm.asyncio import tqdm_asyncio
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicLogger
+from aioquic.quic.configuration import QuicConfiguration
 from cryptography.utils import CryptographyDeprecationWarning
 
 warnings.filterwarnings(action="ignore", category=CryptographyDeprecationWarning)
@@ -160,20 +161,20 @@ def exception_handler(loop, context):
     logging.info(f"Task failed, msg={message}, exception={exception}")
 
 
-def pretty_print(data: list):
-    for item in data:
-        item["server_versions"] = [hex(ver) for ver in item["server_versions"]]
-        item["ALPN"] = [f"{item} ({PROTOCOL_LIST[item]})" for item in item["ALPN"]]
+def pretty_print(item: dict):
+    item["server_versions"] = [hex(ver) for ver in item["server_versions"]]
+    item["ALPN"] = [f"{item} ({PROTOCOL_LIST[item]})" for item in item["ALPN"]]
+    if not item["ALPN"]:
+        item["ALPN"] = "?"
 
-        max_key_length = max(len(key) for key in item.keys())
+    max_key_length = max(len(key) for key in item.keys())
 
-        for key, value in item.items():
-            if key != "success":
-                print(
-                    f"{key.ljust(max_key_length)} : {value if not isinstance(value, list) else ', '.join(value)}"
-                )
-
-        print()
+    for key, value in item.items():
+        if key != "success":
+            print(
+                f"{key.ljust(max_key_length)} : {value if not isinstance(value, list) else ', '.join(value)}"
+            )
+    print()
 
 
 async def test_alpn(endpoint: str, port: int, protocols: list) -> dict:
@@ -182,35 +183,40 @@ async def test_alpn(endpoint: str, port: int, protocols: list) -> dict:
     )
     # Forces version negotiation
     configuration.supported_versions.insert(0, 0x1A2B3D4A)
+    success = False
 
     try:
         async with connect(
             endpoint, port, configuration=configuration
         ) as quic_connection:
             await quic_connection.ping()
+            success = True
+    except Exception:
+        pass
 
-            # Find server supported versions
-            server_versions = []
-            for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
-                if (
-                    event["name"] == "transport:version_information"
-                    and event["data"].get("server_versions") is not None
-                ):
-                    server_versions = event["data"].get("server_versions")
+    # Find server supported versions
+    server_versions = []
+    for event in configuration.quic_logger.to_dict()["traces"][0]["events"]:
+        if (
+            event["name"] == "transport:version_information"
+            and event["data"].get("server_versions") is not None
+        ):
+            server_versions = event["data"].get("server_versions")
+        elif (
+            event["name"] == "transport:packet_received"
+            and len(event["data"].get("frames", [])) > 0
+            and event["data"]["frames"][0].get("frame_type") == "connection_close"
+        ):
+            # Probably application error. Report this ALPN
+            if event["data"]["frames"][0].get("error_code") != 376:
+                success = True
 
-            return {
-                "endpoint": endpoint,
-                "port": port,
-                "server_versions": server_versions,
-                "ALPN": protocols,
-                "success": True,
-            }
-    except:
-        return {
-            "endpoint": endpoint,
-            "port": port,
-            "success": False,
-        }
+    return {
+        "endpoint": endpoint,
+        "port": port,
+        "server_versions": server_versions,
+        "ALPN": protocols if success else [],
+    }
 
 
 async def quic_map(endpoint: str, port: int, sem: asyncio.Semaphore) -> list:
@@ -246,7 +252,19 @@ async def quic_map(endpoint: str, port: int, sem: asyncio.Semaphore) -> list:
     for fut in pending_alpn:
         fut.cancel()
 
-    return [task.result() for task in done_alpn if task.result()["success"]]
+    alpns = []
+    server_versions = ""
+    for task in done_alpn:
+        result = task.result()
+        server_versions = result["server_versions"]
+        alpns.extend(result["ALPN"])
+
+    return {
+        "endpoint": endpoint,
+        "port": port,
+        "ALPN": alpns,
+        "server_versions": server_versions,
+    }
 
 
 async def main(endpoints: list[str], ports: list[int]):
@@ -262,7 +280,8 @@ async def main(endpoints: list[str], ports: list[int]):
     results = await tqdm_asyncio.gather(*tasks)
 
     for result in results:
-        pretty_print(result)
+        if result:
+            pretty_print(result)
 
 
 if __name__ == "__main__":
