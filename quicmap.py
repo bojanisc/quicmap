@@ -10,6 +10,7 @@ import argparse
 import warnings
 import ipaddress
 import logging
+import re
 
 from tqdm.asyncio import tqdm_asyncio
 from aioquic.asyncio import connect
@@ -91,12 +92,14 @@ def parse_ports(port_spec):
 def parse_hosts(host_spec):
     hosts = []
     for host_str in host_spec.split(","):
-        if "-" in host_str:
-            start, end = host_str.split("-")
-            ip_range = ipaddress.summarize_address_range(
-                ipaddress.IPv4Address(start.strip()), ipaddress.IPv4Address(end.strip())
-            )
-            hosts.extend(str(ip) for ip in ip_range)
+        ip_range_match = re.match(
+            r"^(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)$", host_str.strip()
+        )
+        if ip_range_match:
+            start_ip = ipaddress.ip_address(ip_range_match.group(1))
+            end_ip = ipaddress.ip_address(ip_range_match.group(2))
+            ip_range = range(int(start_ip), int(end_ip) + 1)
+            hosts.extend(str(ipaddress.ip_address(ip)) for ip in ip_range)
         elif "/" in host_str:
             cidr = ipaddress.ip_network(host_str.strip(), strict=False)
             hosts.extend(str(ip) for ip in cidr)
